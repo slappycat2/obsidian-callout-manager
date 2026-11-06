@@ -1,0 +1,167 @@
+# Fork automation: follow upstream releases, keep the fork's fixes, publish a build.
+#
+# 1. Merge the latest upstream release tag into master (if not already merged).
+# 2. If master differs from the last fork release, build and publish a new one.
+#
+# Fork versions are X.Y.(Z*1000+N): upstream 1.1.2, fork revision 1 -> 1.1.2001.
+# See FORK.md for why.
+name: Sync upstream and release
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+
+concurrency:
+  group: sync-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: eth-p/obsidian-callout-manager
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  sync-release:
+    # Only run in the fork, never in a repository this file might get merged into.
+    if: github.repository != 'eth-p/obsidian-callout-manager'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out master with full history
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Find the latest upstream release
+        id: upstream
+        run: |
+          tag="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq .tag_name)"
+          if ! [[ "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Unexpected upstream release tag '$tag' (expected X.Y.Z)"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          # Upstream tags are kept out of refs/tags so they can never clash with fork tags.
+          git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" "+refs/tags/${tag}:refs/upstream-tags/${tag}"
+
+      - name: Merge the upstream release into master
+        env:
+          U: ${{ steps.upstream.outputs.tag }}
+        run: |
+          if git merge-base --is-ancestor "refs/upstream-tags/${U}" HEAD; then
+            echo "master already contains upstream ${U}"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git merge --no-edit -m "Merge upstream ${U}" "refs/upstream-tags/${U}"; then
+            git merge --abort || true
+            title="Upstream ${U} needs a manual merge"
+            if [ "$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"${title}\" in:title" --json number --jq length)" = "0" ]; then
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" \
+                --body "Merging upstream release \`${U}\` into \`master\` conflicted with the fork's changes. Upstream may have fixed the same code; check whether the fork is still needed. No fork release was published."
+            fi
+            echo "::error::Merge conflict with upstream ${U}"
+            exit 1
+          fi
+          git push origin HEAD:master
+
+      - name: Decide whether a release is needed
+        id: plan
+        env:
+          U: ${{ steps.upstream.outputs.tag }}
+        run: |
+          IFS=. read -r major minor patch <<< "$U"
+          lo=$((patch * 1000 + 1))
+          hi=$((patch * 1000 + 999))
+          last=0
+          for t in $(git tag --list "${major}.${minor}.*"); do
+            n="${t##*.}"
+            [[ "$n" =~ ^[0-9]+$ ]] || continue
+            if (( n >= lo && n <= hi && n > last )); then last=$n; fi
+          done
+          if (( last > 0 )); then
+            last_tag="${major}.${minor}.${last}"
+            # Changes to the automation or fork notes alone do not warrant a new build.
+            if git diff --quiet "$last_tag" HEAD -- . ':(exclude).github' ':(exclude)FORK.md'; then
+              echo "No source changes since ${last_tag}; nothing to release."
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            next=$((last + 1))
+          else
+            next=$lo
+          fi
+          if (( next > hi )); then
+            echo "::error::Ran out of fork revisions for upstream ${U}"
+            exit 1
+          fi
+          echo "release=true" >> "$GITHUB_OUTPUT"
+          echo "version=${major}.${minor}.${next}" >> "$GITHUB_OUTPUT"
+          echo "revision=$((next - patch * 1000))" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node
+        if: steps.plan.outputs.release == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Build
+        if: steps.plan.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          npm ci --no-audit --no-fund
+          # The version is set for the build only and is never committed, so upstream's
+          # own version bumps cannot conflict with the fork.
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          npm run build
+          test -s dist/main.js && test -s dist/styles.css && test -s manifest.json
+          test "$(node -p "require('./manifest.json').version")" = "$VERSION"
+
+      - name: Check that the popout-window fix is in the build
+        if: steps.plan.outputs.release == 'true'
+        env:
+          U: ${{ steps.upstream.outputs.tag }}
+        run: |
+          if grep -q 'instanceof Element\b' dist/main.js || grep -q 'instanceof HTMLElement\b' dist/main.js; then
+            title="Popout-window fix missing after upstream ${U}"
+            if [ "$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"${title}\" in:title" --json number --jq length)" = "0" ]; then
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" \
+                --body "The build based on upstream \`${U}\` contains a cross-window-unsafe \`instanceof Element\`/\`instanceof HTMLElement\` check again. No fork release was published; the previous one stays installed."
+            fi
+            echo "::error::Cross-window-unsafe instanceof check found in dist/main.js"
+            exit 1
+          fi
+
+      - name: Run tests (informational; upstream has known failures in sort.test.ts)
+        if: steps.plan.outputs.release == 'true'
+        continue-on-error: true
+        run: npm test
+
+      - name: Publish the fork release
+        if: steps.plan.outputs.release == 'true'
+        env:
+          U: ${{ steps.upstream.outputs.tag }}
+          VERSION: ${{ steps.plan.outputs.version }}
+          REVISION: ${{ steps.plan.outputs.revision }}
+        run: |
+          gh release create "$VERSION" dist/main.js manifest.json dist/styles.css \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$(git rev-parse HEAD)" \
+            --title "$VERSION" \
+            --notes "Fork revision ${REVISION} of upstream [${U}](https://github.com/${UPSTREAM_REPO}/releases/tag/${U}), with the fork's fixes applied. See FORK.md."
+
+      - name: Keep the schedule alive
+        # GitHub disables scheduled workflows in repositories with no activity for 60 days.
+        if: github.event_name == 'schedule'
+        continue-on-error: true
+        run: gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/sync-release.yml/enable"
